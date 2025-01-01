@@ -1,0 +1,6 @@
+{
+  "license": "GPL-2.0-or-later",
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}

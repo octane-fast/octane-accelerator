@@ -1,0 +1,436 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build shared Jolt artifacts (platform-independent) ──────────────
+  build-jolt-artifacts:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64imac-unknown-none-elf
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/jolt-guest-targets
+          key: jolt-artifacts-v1
+      - name: Install jolt CLI
+        run: |
+          git clone --depth 1 https://github.com/octane-fast/jolt /tmp/jolt-sdk
+          cd /tmp/jolt-sdk
+          cargo install --path . --locked
+      - name: Clone jolt-zktls
+        run: git clone --depth 1 https://github.com/octane-fast/jolt-zktls /tmp/jolt-zktls
+      - name: Get jolt-zktls commit SHA
+        id: jolt-sha
+        run: echo "sha=$(cd /tmp/jolt-zktls && git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache preprocessing artifacts
+        id: preprocess-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/jolt-staged
+          key: jolt-preprocess-${{ steps.jolt-sha.outputs.sha }}
+      - name: Build guest ELF
+        if: steps.preprocess-cache.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp/jolt-zktls/prove
+          cargo build --release --bin jolt_prove 2>&1 | tail -5
+      - name: Generate preprocessing data
+        if: steps.preprocess-cache.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp/jolt-zktls/prove
+          mkdir -p /tmp/jolt-preprocess
+          RAYON_NUM_THREADS=4 ./target/release/jolt_prove --preprocess /tmp/jolt-preprocess
+      - name: Stage artifacts
+        if: steps.preprocess-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/jolt-staged
+          cp /tmp/jolt-preprocess/jolt_prover_preprocessing.dat /tmp/jolt-staged/
+          cp /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest /tmp/jolt-staged/guest
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jolt-artifacts
+          path: /tmp/jolt-staged/*
+
+  # ── Build: compile binaries ─────────────────────────────────────────
+  build-macos-arm64:
+    needs: [build-jolt-artifacts]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-artifacts
+          path: /tmp/jolt-artifacts
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install OpenMP
+        run: brew install libomp
+      - name: Clone jolt-zktls
+        run: git clone --depth 1 https://github.com/octane-fast/jolt-zktls ../jolt-zktls
+      - name: Build jolt_prove (with embedded data)
+        run: |
+          cd ../jolt-zktls/prove
+          mkdir -p preprocess
+          cp /tmp/jolt-artifacts/jolt_prover_preprocessing.dat preprocess/
+          mkdir -p /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/
+          cp /tmp/jolt-artifacts/guest /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest
+          JOLT_PREPROCESS_DAT=preprocess/jolt_prover_preprocessing.dat \
+          JOLT_GUEST_ELF=/tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest \
+          cargo build --release --bin jolt_prove
+      - name: Build bundle
+        run: bash scripts/build-bundle.sh
+      - name: Build Accelerator
+        run: make CXX=clang++
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-binary
+          path: octane-accelerator
+
+  build-linux-x64:
+    needs: [build-jolt-artifacts]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-artifacts
+          path: /tmp/jolt-artifacts
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: sudo apt-get install -y libomp-dev libssl-dev
+      - name: Clone jolt-zktls
+        run: git clone --depth 1 https://github.com/octane-fast/jolt-zktls ../jolt-zktls
+      - name: Build jolt_prove (with embedded data)
+        run: |
+          cd ../jolt-zktls/prove
+          mkdir -p preprocess
+          cp /tmp/jolt-artifacts/jolt_prover_preprocessing.dat preprocess/
+          mkdir -p /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/
+          cp /tmp/jolt-artifacts/guest /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest
+          JOLT_PREPROCESS_DAT=preprocess/jolt_prover_preprocessing.dat \
+          JOLT_GUEST_ELF=/tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest \
+          cargo build --release --bin jolt_prove
+      - name: Build bundle
+        run: bash scripts/build-bundle.sh
+      - name: Build Accelerator
+        run: make CXX=g++ ENABLE_LTO=0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-binary
+          path: octane-accelerator
+
+  build-windows-x64:
+    needs: [build-jolt-artifacts]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jolt-artifacts
+          path: C:\jolt-artifacts
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl make
+      - name: Clone jolt-zktls
+        shell: bash
+        run: git clone --depth 1 https://github.com/octane-fast/jolt-zktls ../jolt-zktls
+      - name: Build jolt_prove (with embedded data)
+        shell: bash
+        run: |
+          cd ../jolt-zktls/prove
+          mkdir -p preprocess
+          cp /c/jolt-artifacts/jolt_prover_preprocessing.dat preprocess/
+          mkdir -p /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/
+          cp /c/jolt-artifacts/guest /tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest
+          JOLT_PREPROCESS_DAT=preprocess/jolt_prover_preprocessing.dat \
+          JOLT_GUEST_ELF=/tmp/jolt-guest-targets/guest-prove_decrypt/riscv64imac-unknown-none-elf/release/guest \
+          cargo build --release --bin jolt_prove
+      - name: Build bundle
+        shell: bash
+        run: bash scripts/build-bundle.sh
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          windres res/app.rc -o app_res.o
+          make CXX=g++ TARGET=octane-accelerator.exe RC_OBJ=app_res.o
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-binary
+          path: octane-accelerator.exe
+
+  # ── E2E Tests ───────────────────────────────────────────────────────
+  test-macos-arm64:
+    needs: [build-macos-arm64]
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-binary
+          path: .
+      - name: Install Python deps
+        run: pip3 install --break-system-packages websocket-client requests
+      - name: Start server
+        run: |
+          chmod +x octane-accelerator
+          ./octane-accelerator &
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 10); do
+            curl -s http://127.0.0.1:19876/health && break
+            sleep 1
+          done
+      - name: Test /health
+        run: |
+          RESP=$(curl -s http://127.0.0.1:19876/health)
+          echo "$RESP"
+          echo "$RESP" | grep -q '"ready"'
+      - name: Test /pair/export
+        run: |
+          RESP=$(curl -s -X POST http://127.0.0.1:19876/pair/export)
+          echo "$RESP"
+          echo "$RESP" | grep -q '^relay=' || (echo "FAIL: missing relay=" && exit 1)
+          echo "$RESP" | grep -q '^room=' || (echo "FAIL: missing room=" && exit 1)
+          echo "$RESP" | grep -q '^key=' || (echo "FAIL: missing key=" && exit 1)
+          echo "pair/export OK"
+      - name: Run benchmark
+        id: bench_macos_arm64
+        run: |
+          RESP=$(curl -s -X POST http://127.0.0.1:19876/benchmark -d '{"count":1}')
+          echo "$RESP"
+          AVG=$(echo "$RESP" | grep '"done"' | python3 -c "import sys,json; [print(f'{json.loads(l)[\"avg_ms\"]:.1f}') for l in sys.stdin if 'done' in l]")
+          [ -n "$AVG" ] && [ "$(echo "$AVG > 0" | bc)" = "1" ] || (echo "FAIL: avg_ms not a positive number" && exit 1)
+          echo "avg_ms=$AVG" >> "$GITHUB_OUTPUT"
+          echo "## macOS ARM64 Benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Avg range proof | ${AVG} ms |" >> "$GITHUB_STEP_SUMMARY"
+      - name: E2E /prove WebSocket tests (local)
+        run: python3 tests/test_prove_e2e.py
+      - name: E2E /prove WebSocket tests (relay)
+        run: python3 tests/test_prove_e2e.py --relay
+
+  test-linux-x64:
+    needs: [build-linux-x64]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-binary
+          path: .
+      - name: Install Python deps
+        run: pip3 install websocket-client requests
+      - name: Start server
+        run: |
+          chmod +x octane-accelerator
+          ./octane-accelerator &
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 10); do
+            curl -s http://127.0.0.1:19876/health && break
+            sleep 1
+          done
+      - name: Test /health
+        run: |
+          RESP=$(curl -s http://127.0.0.1:19876/health)
+          echo "$RESP"
+          echo "$RESP" | grep -q '"ready"'
+      - name: Test /pair/export
+        run: |
+          RESP=$(curl -s -X POST http://127.0.0.1:19876/pair/export)
+          echo "$RESP"
+          echo "$RESP" | grep -q '^relay=' || (echo "FAIL: missing relay=" && exit 1)
+          echo "$RESP" | grep -q '^room=' || (echo "FAIL: missing room=" && exit 1)
+          echo "$RESP" | grep -q '^key=' || (echo "FAIL: missing key=" && exit 1)
+          echo "pair/export OK"
+      - name: Run benchmark
+        id: bench_linux
+        run: |
+          RESP=$(curl -s -X POST http://127.0.0.1:19876/benchmark -d '{"count":1}')
+          echo "$RESP"
+          AVG=$(echo "$RESP" | grep '"done"' | python3 -c "import sys,json; [print(f'{json.loads(l)[\"avg_ms\"]:.1f}') for l in sys.stdin if 'done' in l]")
+          [ -n "$AVG" ] && [ "$(echo "$AVG > 0" | bc)" = "1" ] || (echo "FAIL: avg_ms not a positive number" && exit 1)
+          echo "avg_ms=$AVG" >> "$GITHUB_OUTPUT"
+          echo "## Linux x64 Benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Avg range proof | ${AVG} ms |" >> "$GITHUB_STEP_SUMMARY"
+      - name: E2E /prove WebSocket tests (local)
+        run: python3 tests/test_prove_e2e.py
+      - name: E2E /prove WebSocket tests (relay)
+        run: python3 tests/test_prove_e2e.py --relay
+
+  test-windows-x64:
+    needs: [build-windows-x64]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-binary
+          path: .
+      - name: Install Python deps
+        shell: pwsh
+        run: pip install websocket-client requests
+      - name: Start server
+        shell: pwsh
+        run: |
+          Start-Process -FilePath .\octane-accelerator.exe -WindowStyle Hidden
+          Start-Sleep 3
+          $listening = Get-NetTCPConnection -LocalPort 19876 -ErrorAction SilentlyContinue
+          if (-not $listening) { throw "Server not listening on port 19876" }
+          Write-Output "Server listening on 127.0.0.1:19876"
+      - name: Test /health
+        shell: pwsh
+        run: |
+          $resp = Invoke-RestMethod http://127.0.0.1:19876/health
+          Write-Output $resp
+          if ($resp.status -ne "ready") { throw "Health check failed" }
+      - name: Test /pair/export
+        shell: pwsh
+        run: |
+          $resp = Invoke-RestMethod -Method POST http://127.0.0.1:19876/pair/export
+          Write-Output $resp
+          if ($resp -notmatch "relay=") { throw "FAIL: missing relay=" }
+          if ($resp -notmatch "room=") { throw "FAIL: missing room=" }
+          if ($resp -notmatch "key=") { throw "FAIL: missing key=" }
+          Write-Output "pair/export OK"
+      - name: Run benchmark
+        shell: pwsh
+        run: |
+          $body = '{"count":1}'
+          $resp = Invoke-RestMethod -Method POST -Body $body -ContentType "application/json" http://127.0.0.1:19876/benchmark
+          Write-Output ($resp | ConvertTo-Json)
+      - name: E2E /prove WebSocket tests (local)
+        shell: pwsh
+        run: python tests/test_prove_e2e.py
+      - name: E2E /prove WebSocket tests (relay)
+        shell: pwsh
+        run: python tests/test_prove_e2e.py --relay
+
+  # ── Package (sign, notarize, create release artifacts) ──────────────
+  package-macos-arm64:
+    needs: [test-macos-arm64]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-binary
+          path: .
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_FILE=$(mktemp).p12
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode -o "$CERT_FILE"
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import "$CERT_FILE" -k build.keychain -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          rm "$CERT_FILE"
+      - name: Create and sign DMG
+        env:
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+        run: |
+          chmod +x octane-accelerator
+          ./scripts/create-dmg.sh ./octane-accelerator arm64
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit octane-accelerator-macos-arm64.dmg \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple octane-accelerator-macos-arm64.dmg
+      - name: Package tar.gz (for install.sh)
+        run: |
+          chmod +x octane-accelerator
+          tar czf octane-accelerator-macos-arm64.tar.gz octane-accelerator icon.svg icon128.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-release
+          path: |
+            octane-accelerator-macos-arm64.dmg
+            octane-accelerator-macos-arm64.tar.gz
+
+  package-linux-x64:
+    needs: [test-linux-x64]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-binary
+          path: .
+      - name: Package
+        run: |
+          chmod +x octane-accelerator
+          tar czf octane-accelerator-linux-x64.tar.gz octane-accelerator icon.svg icon128.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-release
+          path: octane-accelerator-linux-x64.tar.gz
+
+  package-windows-x64:
+    needs: [test-windows-x64]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-binary
+          path: .
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path octane-accelerator.exe,icon128.png -DestinationPath octane-accelerator-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-release
+          path: octane-accelerator-windows-x64.zip
+
+  # ── Release ─────────────────────────────────────────────────────────
+  release:
+    needs: [package-macos-arm64, package-linux-x64, package-windows-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            octane-accelerator-macos-arm64.dmg
+            octane-accelerator-macos-arm64.tar.gz
+            octane-accelerator-linux-x64.tar.gz
+            octane-accelerator-windows-x64.zip
+          generate_release_notes: true
